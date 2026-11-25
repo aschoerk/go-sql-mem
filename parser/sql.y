@@ -200,7 +200,7 @@ connection_level:
       { $$ = NewConnectionLevelRequest($2,$3)}
 
 delete: DELETE FROM table_reference opt_where
-    { $$ = &GoSqlDeleteRequest{NewStatementBaseData(),$3, $4}}            
+    { $$ = &GoSqlDeleteRequest{NewStatementBaseData(),[]*GoSqlTableReference{$3}, $4}}            
 
 update: UPDATE table_reference SET update_specs opt_where
     { $$ = NewUpdateRequest($2, $4, $5) }
@@ -217,13 +217,13 @@ update_spec: identifier EQUAL term
 
 select: SELECT 
           distinct_all select_list
-        FROM table_reference
+        FROM joined_table
         opt_where 
         opt_group_by 
         opt_having
         opt_order_by
         opt_for_update
-  { $$ = &GoSqlSelectRequest { NewStatementBaseData(), $2, $3, $5, $6, $7, $8, $9, $10 }}
+  { $$ = &GoSqlSelectRequest { NewStatementBaseData(), $2, $3, []*GoSqlTableReference{{JoinedTable: $5}}, $6, $7, $8, $9, $10 }}
 
 distinct_all: 
    { $$ = ALL }
@@ -270,11 +270,17 @@ table_reference:
 
 joined_table:
     table_reference
-    { $$ = nil }
+    { $$ = &GoSqlJoinedTable{TableReferenceRight: $1} }
     | joined_table COMMA table_reference
-    { $$ = nil }
+    { $$ = &GoSqlJoinedTable{JoinedTableLeft: $1, JoinType: CROSS, TableReferenceRight: $3} }
     | joined_table join_type JOIN table_reference join_specification
-    { $$ = nil }
+    {
+      joinType := $2
+      if joinType == 0 {
+        joinType = INNER
+      }
+      $$ = &GoSqlJoinedTable{JoinedTableLeft: $1, JoinType: joinType, TableReferenceRight: $4, condition: $5}
+    }
     ;
 
 join_specification:

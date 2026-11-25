@@ -17,7 +17,7 @@ type GoSqlSelectRequest struct {
 	data.BaseStatement
 	allDistinct int
 	selectList  []SelectListEntry
-	from        []*GoSqlFromSpec
+	from        []*GoSqlTableReference
 	where       *GoSqlTerm
 	groupBy     []*GoSqlTerm
 	having      *GoSqlTerm

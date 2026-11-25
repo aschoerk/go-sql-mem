@@ -23,7 +23,7 @@ type FromPart struct {
 // allows conversion of GoSqlIdentifier to index so that machine can access attributes by index
 // Next-Operation iterates through valid
 type FromHandler interface {
-	Init(*data.BaseStatement, []*GoSqlFromSpec)
+	Init(*GoSqlSelectRequest) []error
 	GetValue(data.GoSqlIdentifier) driver.Value
 	getView() data.Table
 }
@@ -35,7 +35,7 @@ type IdentifierMapEntry struct {
 
 type GoSqlFromHandler struct {
 	baseStmt       data.BaseStatement
-	fromSpec       []*GoSqlFromSpec
+	fromSpec       []*GoSqlTableReference
 	identifierMap  map[*GoSqlTerm]IdentifierMapEntry
 	fromExprs      []*FromExpr
 	equalJoinParts []equalJoinPart
@@ -67,10 +67,53 @@ type FromExpr struct {
 	tableExprs []*TableExpr
 }
 
-func (g *GoSqlFromHandler) identifyTable(identifier GoSqlAsIdentifier) (*TableExpr, bool) {
-	alias := identifier.Alias
-	table, exists := data.GetTable(g.baseStmt, identifier.Id)
-	return &TableExpr{0, table, false, []int{}, alias, nil}, exists
+func (g *GoSqlFromHandler) identifyTable(ref *GoSqlTableReference) (*TableExpr, bool) {
+	if ref == nil || ref.Select != nil || ref.JoinedTable != nil || len(ref.Id.Parts) == 0 {
+		return nil, false
+	}
+	table, exists := data.GetTable(g.baseStmt, ref.Id)
+	return &TableExpr{0, table, false, []int{}, ref.As, nil}, exists
+}
+
+// a table flattened out of the (possibly nested) table-reference / joined-table structure of the from-clause.
+// joinType and condition describe how this table is joined with the preceding tables.
+type flatTableReference struct {
+	ref       *GoSqlTableReference
+	joinType  int
+	condition *GoSqlTerm
+}
+
+// flattenJoinedTable converts a join tree into the list of tables in the order they have to be joined
+func flattenJoinedTable(jt *GoSqlJoinedTable, res []flatTableReference) []flatTableReference {
+	if jt == nil {
+		return res
+	}
+	if jt.JoinedTableLeft == nil {
+		// leftmost table of a join chain, nothing is joined with it yet
+		return append(res, flatTableReference{jt.TableReferenceRight, 0, jt.condition})
+	}
+	res = flattenJoinedTable(jt.JoinedTableLeft, res)
+	joinType := jt.JoinType
+	if joinType == 0 {
+		joinType = INNER
+	}
+	return append(res, flatTableReference{jt.TableReferenceRight, joinType, jt.condition})
+}
+
+// flattenTableReferences returns all tables of a from-clause in join order
+func flattenTableReferences(refs []*GoSqlTableReference) []flatTableReference {
+	var res []flatTableReference
+	for _, ref := range refs {
+		if ref == nil {
+			continue
+		}
+		if ref.JoinedTable != nil {
+			res = flattenJoinedTable(ref.JoinedTable, res)
+		} else {
+			res = append(res, flatTableReference{ref, 0, nil})
+		}
+	}
+	return res
 }
 
 func (g *GoSqlFromHandler) Init(selectStatement *GoSqlSelectRequest) []error {
@@ -410,6 +453,9 @@ type equalJoin struct {
 }
 
 func (g *GoSqlFromHandler) onlyEqualJoinExpression(term *GoSqlTerm) bool {
+	if term == nil {
+		return false
+	}
 	if term.left != nil && term.right != nil {
 		if term.operator == AND {
 			leftOk := g.onlyEqualJoinExpression(term.left)
@@ -464,9 +510,9 @@ func (g *GoSqlFromHandler) checkAndInitDataStructures(selectStatement *GoSqlSele
 	g.fromExprs = make([]*FromExpr, 0)
 	var asDefinitions = make(map[string]*TableExpr)
 	var tableMap = make(map[data.Table]data.Table)
-	idHandler := func(id GoSqlAsIdentifier) *TableExpr {
-		if joinExpr, exists := g.identifyTable(id); !exists {
-			errs = append(errs, fmt.Errorf("tableExpr %v does not exist", id))
+	idHandler := func(ref *GoSqlTableReference) *TableExpr {
+		if joinExpr, exists := g.identifyTable(ref); !exists {
+			errs = append(errs, fmt.Errorf("tableExpr %v does not exist", ref.Id))
 			return nil
 		} else {
 			fromExpr := g.fromExprs[len(g.fromExprs)-1]
@@ -491,55 +537,59 @@ func (g *GoSqlFromHandler) checkAndInitDataStructures(selectStatement *GoSqlSele
 	g.identifierMap = make(map[*GoSqlTerm]IdentifierMapEntry)
 	for _, spec := range g.fromSpec {
 		g.fromExprs = append(g.fromExprs, &FromExpr{[]*TableExpr{}})
-		idHandler(spec.Id)
-		for _, joinSpec := range spec.JoinSpecs {
-			joinExpr := idHandler(joinSpec.JoinedTable)
-			if joinExpr != nil {
-				joinExpr.joinType = joinSpec.JoinMode
+		actFromExpr := g.fromExprs[len(g.fromExprs)-1]
+		for ix, flatRef := range flattenTableReferences([]*GoSqlTableReference{spec}) {
+			joinExpr := idHandler(flatRef.ref)
+			if joinExpr == nil {
+				continue
 			}
-			if joinExpr.joinType == CROSS && joinSpec.JoinCondition != nil {
-				errs = append(errs, fmt.Errorf("cross join condition defined for tableExpr %v", spec.Id))
-			} else {
-				actFromExpr := g.fromExprs[len(g.fromExprs)-1]
-				switch joinExpr.joinType {
-				case RIGHT:
-					joinExpr.isOuter = true
-				case FULL:
-					joinExpr.isOuter = true
-					actFromExpr.tableExprs[len(actFromExpr.tableExprs)-1].isOuter = true
-				case LEFT:
-					actFromExpr.tableExprs[len(actFromExpr.tableExprs)-1].isOuter = true
-				}
-				condition := joinSpec.JoinCondition
-				joinExpr.condition = condition
-				aggr := findAggregateTerms(condition, nil)
-				if aggr != nil {
-					errs = append(errs, fmt.Errorf("aggregate term defined for tableExpr %v", spec.Id))
-				}
-				identifierTerms := findIdentifiers(condition, nil)
-				for _, identifierTerm := range identifierTerms {
-					id := identifierTerm.leaf.ptr.(data.GoSqlIdentifier)
-					var matchedJoinExpr *TableExpr
-					var matchIx = -1
-					for _, joinExpr := range actFromExpr.tableExprs {
-						matches, columnix, err := matchIdToJoinExpr(g.baseStmt, &id, joinExpr)
-						if err != nil {
-							errs = append(errs, err)
-						} else if matches {
-							if matchedJoinExpr == nil {
-								matchedJoinExpr = joinExpr
-								matchIx = columnix
-							} else {
-								errs = append(errs, fmt.Errorf("duplicate join expression for tableExpr %v", spec.Id))
-							}
+			joinExpr.joinType = flatRef.joinType
+			if joinExpr.joinType == CROSS && flatRef.condition != nil {
+				errs = append(errs, fmt.Errorf("cross join condition defined for tableExpr %v", flatRef.ref.Id))
+				continue
+			}
+			switch joinExpr.joinType {
+			case RIGHT:
+				joinExpr.isOuter = true
+			case FULL:
+				joinExpr.isOuter = true
+				actFromExpr.tableExprs[len(actFromExpr.tableExprs)-1].isOuter = true
+			case LEFT:
+				actFromExpr.tableExprs[len(actFromExpr.tableExprs)-1].isOuter = true
+			}
+			if ix == 0 || flatRef.condition == nil {
+				// the first table of a from-clause and tables not joined by a condition define no join restriction
+				continue
+			}
+			condition := flatRef.condition
+			joinExpr.condition = condition
+			aggr := findAggregateTerms(condition, nil)
+			if aggr != nil {
+				errs = append(errs, fmt.Errorf("aggregate term defined for tableExpr %v", flatRef.ref.Id))
+			}
+			identifierTerms := findIdentifiers(condition, nil)
+			for _, identifierTerm := range identifierTerms {
+				id := identifierTerm.leaf.ptr.(data.GoSqlIdentifier)
+				var matchedJoinExpr *TableExpr
+				var matchIx = -1
+				for _, joinExpr := range actFromExpr.tableExprs {
+					matches, columnix, err := matchIdToJoinExpr(g.baseStmt, &id, joinExpr)
+					if err != nil {
+						errs = append(errs, err)
+					} else if matches {
+						if matchedJoinExpr == nil {
+							matchedJoinExpr = joinExpr
+							matchIx = columnix
+						} else {
+							errs = append(errs, fmt.Errorf("duplicate join expression for tableExpr %v", flatRef.ref.Id))
 						}
 					}
-					if matchedJoinExpr == nil {
-						errs = append(errs, fmt.Errorf("not found Identifier %v", identifierTerm.leaf.ptr))
-					} else {
-						matchedJoinExpr.joinCols = append(matchedJoinExpr.joinCols, matchIx)
-						g.identifierMap[identifierTerm] = IdentifierMapEntry{matchIx, matchedJoinExpr}
-					}
+				}
+				if matchedJoinExpr == nil {
+					errs = append(errs, fmt.Errorf("not found Identifier %v", identifierTerm.leaf.ptr))
+				} else {
+					matchedJoinExpr.joinCols = append(matchedJoinExpr.joinCols, matchIx)
+					g.identifierMap[identifierTerm] = IdentifierMapEntry{matchIx, matchedJoinExpr}
 				}
 			}
 		}
